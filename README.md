@@ -24,18 +24,18 @@ Work in progress.
 
 ## How to work on it
 
-###Clone the repo
+### Clone the repo
 git clone https://github.com/satwik-exe/lfs-fuse.git
 cd lfs-fuse
 
-###Install dependencies inside Ubuntu
+### Install dependencies inside Ubuntu
 sudo apt update
 sudo apt install build-essential libfuse3-dev fuse3 git pkg-config
 
-###Verify FUSE
+### Verify FUSE
 pkg-config fuse3 --cflags --libs
 
-###Create local mount dir
+### Create local mount dir
 mkdir -p mount
 
 ###Build and run locally every time
