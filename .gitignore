@@ -1,0 +1,13 @@
+# Compiled binaries
+lfs
+mkfs_lfs
+
+# Disk image
+lfs.img
+
+# Mount directory
+mount/
+
+# Editor temp files
+*.swp
+*.out
