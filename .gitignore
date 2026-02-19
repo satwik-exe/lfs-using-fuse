@@ -5,6 +5,14 @@ mkfs_lfs
 # Disk image
 lfs.img
 
+# Compiled files
+src/*.o
+src/lfs.o
+src/disk.o
+src/log.o
+src/inode.o
+src/mkfs_lfs.o
+
 # Mount directory
 mount/
 
