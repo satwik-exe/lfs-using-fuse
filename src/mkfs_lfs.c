@@ -33,7 +33,7 @@ static void write_block(int fd, uint32_t block, const void *data)
 
 int main(void)
 {
-    int fd = open("lfs.img", O_CREAT | O_RDWR | O_TRUNC, 0666);
+    int fd = open("../lfs.img", O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fd < 0) { perror("open"); return 1; }
     if (ftruncate(fd, (off_t)BLOCK_SIZE * TOTAL_BLOCKS) != 0) {
         perror("ftruncate"); return 1;
