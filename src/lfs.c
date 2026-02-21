@@ -75,7 +75,7 @@ static void *lfs_init(struct fuse_conn_info *conn,
 
     memset(&g_state, 0, sizeof(g_state));
 
-    if (disk_open("../lfs.img") != 0) {
+    if (disk_open("/home/kiit/lfs-fuse/lfs.img") != 0) {
         fprintf(stderr, "lfs_init: cannot open lfs.img\n");
         return NULL;
     }
