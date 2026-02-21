@@ -22,3 +22,15 @@ in user space using FUSE and C.
 ## Status
 Work in progress.
 
+## run
+
+- ../lfs -f ../mount
+ in new terminal;
+
+ - cd ~/lfs-fuse
+ - ls mount
+ - cat mount/hello.txt
+
+ - echo "testing LFS write" > mount/newfile.txt
+- cat mount/newfile.txt
+- ls mount
