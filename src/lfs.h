@@ -12,8 +12,15 @@
 #define BLOCK_SIZE       4096
 #define TOTAL_BLOCKS     1024          /* 4 MB disk image            */
 #define INODE_MAP_BLOCK  1             /* block where inode map lives */
-#define INODE_MAP_SIZE   128           /* max inodes supported        */
+#define INODE_MAP_SIZE   256           /* max inodes supported        */
 #define LOG_START_BLOCK  10            /* first block usable for log  */
+
+/* Segment = 32 blocks = 128 KB                                      */
+#define BLOCKS_PER_SEGMENT  32
+#define SEGMENT_COUNT       (TOTAL_BLOCKS / BLOCKS_PER_SEGMENT)
+
+/* GC triggers when free blocks drop below this threshold            */
+#define GC_THRESHOLD        100
 
 #define INODE_TYPE_FILE  1
 #define INODE_TYPE_DIR   2
@@ -52,9 +59,22 @@ struct lfs_dirent {
     char     name[MAX_NAME_LEN];
 };
 
-/* Block 1: array of INODE_MAP_SIZE uint32_t block addresses.
-   inode_map[ino] = block number where that inode currently lives.
-   0 means the inode does not exist.                                 */
+/*
+ * Segment summary — stored as the FIRST block of every segment.
+ * For each block in the segment, records which inode owns it and
+ * which logical block within that file it represents.
+ * This is what GC uses to decide if a block is live or dead.
+ */
+struct lfs_segment_summary {
+    /* entry[i] describes the (i+1)th block of the segment
+       (entry[0] is skipped — that block IS the summary)            */
+    struct {
+        uint32_t inode_no;   /* which inode owns this block         */
+        uint32_t block_idx;  /* index into inode->direct[]          */
+    } entry[BLOCKS_PER_SEGMENT];
+    uint8_t _pad[BLOCK_SIZE
+                 - BLOCKS_PER_SEGMENT * 2 * sizeof(uint32_t)];
+} __attribute__((packed));
 
 /* ================================================================
    In-memory runtime state  (not written to disk as a unit)
@@ -77,27 +97,25 @@ void disk_close(void);
 /* ================================================================
    Log layer API  (log.c)
    ================================================================ */
-
-/* Append one 4 KB block to the log; returns the block number written
-   to, or -1 on error.                                               */
-int  log_append(struct lfs_state *state, const void *buf);
-
-/* Persist the inode map and superblock (called after every mutation) */
+int  log_append    (struct lfs_state *state, const void *buf);
 int  log_checkpoint(struct lfs_state *state);
 
 /* ================================================================
    Inode helpers  (inode.c)
    ================================================================ */
-
-/* Read the inode for 'ino' into *out.  Returns 0 on success.        */
 int  inode_read (struct lfs_state *state, uint32_t ino,
                  struct lfs_inode *out);
-
-/* Write (append) an inode to the log and update the inode map.
-   Returns 0 on success.                                             */
 int  inode_write(struct lfs_state *state, const struct lfs_inode *in);
-
-/* Allocate the next free inode number.  Returns -1 if full.         */
 int  inode_alloc(struct lfs_state *state);
+
+/* ================================================================
+   Garbage collector  (gc.c)
+   ================================================================ */
+
+/* Returns 1 if GC should run (disk getting full), 0 otherwise       */
+int  gc_should_run(struct lfs_state *state);
+
+/* Run one GC pass — clean the segment with most dead blocks         */
+int  gc_collect   (struct lfs_state *state);
 
 #endif /* LFS_H */

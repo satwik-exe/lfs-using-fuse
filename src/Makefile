@@ -3,7 +3,7 @@ CFLAGS  = -Wall -Wextra -g $(shell pkg-config --cflags fuse3)
 LDFLAGS = $(shell pkg-config --libs fuse3)
 
 # Source files shared between lfs and mkfs
-COMMON_SRCS = disk.c log.c inode.c
+COMMON_SRCS = disk.c log.c inode.c gc.c
 COMMON_OBJS = $(COMMON_SRCS:.c=.o)
 
 LFS_SRCS    = lfs.c $(COMMON_SRCS)
