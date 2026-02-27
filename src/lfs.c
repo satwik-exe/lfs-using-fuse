@@ -187,16 +187,26 @@ static int lfs_read(const char *path, char *buf, size_t size,
         return -EISDIR;
 
     if (offset >= (off_t)inode.size) return 0;
-
     if (offset + (off_t)size > (off_t)inode.size)
         size = inode.size - offset;
 
-    uint8_t data[BLOCK_SIZE];
-    if (disk_read(inode.direct[0], data) != 0)
-        return -EIO;
+    size_t bytes_read = 0;
+    while (bytes_read < size) {
+        uint32_t block_idx = (uint32_t)((offset + bytes_read) / BLOCK_SIZE);
+        uint32_t block_off = (uint32_t)((offset + bytes_read) % BLOCK_SIZE);
 
-    memcpy(buf, data + offset, size);
-    return (int)size;
+        size_t chunk = BLOCK_SIZE - block_off;
+        if (chunk > size - bytes_read) chunk = size - bytes_read;
+
+        uint8_t data[BLOCK_SIZE];
+        memset(data, 0, BLOCK_SIZE);
+        if (inode.direct[block_idx] != 0)
+            disk_read(inode.direct[block_idx], data);
+
+        memcpy(buf + bytes_read, data + block_off, chunk);
+        bytes_read += chunk;
+    }
+    return (int)bytes_read;
 }
 
 static int lfs_create(const char *path, mode_t mode,
@@ -227,19 +237,14 @@ static int lfs_create(const char *path, mode_t mode,
         gc_collect(&g_state);
     }
 
-    uint8_t zero_block[BLOCK_SIZE];
-    memset(zero_block, 0, BLOCK_SIZE);
-    int data_block = log_append_ex(&g_state, zero_block,
-                                   (uint32_t)ino, 0);
-    if (data_block < 0) return -ENOSPC;
-
+    /* Don't pre-allocate a data block — lfs_write creates blocks on demand.
+     * Leaving direct[] = 0 means the first write will allocate block 0. */
     struct lfs_inode new_inode;
     memset(&new_inode, 0, sizeof(new_inode));
     new_inode.inode_no  = (uint32_t)ino;
     new_inode.type      = INODE_TYPE_FILE;
     new_inode.size      = 0;
     new_inode.nlinks    = 1;
-    new_inode.direct[0] = (uint32_t)data_block;
 
     if (inode_write(&g_state, &new_inode) != 0) return -EIO;
 
@@ -280,41 +285,68 @@ static int lfs_write(const char *path, const char *buf, size_t size,
     int ino = path_to_inode(path);
     if (ino < 0) return ino;
 
+    /* Always re-read inode fresh from disk at the start of each call */
     struct lfs_inode inode;
     if (inode_read(&g_state, (uint32_t)ino, &inode) != 0)
         return -EIO;
     if (inode.type != INODE_TYPE_FILE)
         return -EISDIR;
 
-    if (offset + (off_t)size > BLOCK_SIZE) {
-        fprintf(stderr, "lfs_write: exceeds single block limit\n");
-        return -EFBIG;
+    off_t max_size = (off_t)MAX_DIRECT_PTRS * BLOCK_SIZE;
+    if (offset >= max_size) return -EFBIG;
+    if (offset + (off_t)size > max_size)
+        size = (size_t)(max_size - offset);
+
+    /* Determine which blocks are touched by this write */
+    uint32_t first_blk = (uint32_t)(offset / BLOCK_SIZE);
+    uint32_t last_blk  = (uint32_t)((offset + size - 1) / BLOCK_SIZE);
+
+    for (uint32_t blk = first_blk; blk <= last_blk; blk++) {
+        uint32_t blk_start = blk * BLOCK_SIZE;
+        uint32_t blk_end   = blk_start + BLOCK_SIZE;
+
+        /* Byte range within buf that falls in this block */
+        uint32_t write_start = (uint32_t)offset > blk_start
+                               ? (uint32_t)offset : blk_start;
+        uint32_t write_end   = (uint32_t)(offset + size) < blk_end
+                               ? (uint32_t)(offset + size) : blk_end;
+
+        uint32_t blk_off  = write_start - blk_start;
+        uint32_t buf_off  = write_start - (uint32_t)offset;
+        uint32_t chunk    = write_end - write_start;
+
+        /* Read existing block content (preserve bytes not being written) */
+        uint8_t data[BLOCK_SIZE];
+        memset(data, 0, BLOCK_SIZE);
+        if (inode.direct[blk] != 0)
+            disk_read(inode.direct[blk], data);
+
+        memcpy(data + blk_off, buf + buf_off, chunk);
+
+        if (gc_should_run(&g_state)) {
+            printf("lfs_write: GC triggered! free=%u\n",
+                   g_state.sb.total_blocks - g_state.log_tail);
+            gc_collect(&g_state);
+            /* Re-read inode — GC may have moved our blocks */
+            if (inode_read(&g_state, (uint32_t)ino, &inode) != 0)
+                return -EIO;
+            /* Re-read block again with updated pointer */
+            memset(data, 0, BLOCK_SIZE);
+            if (inode.direct[blk] != 0)
+                disk_read(inode.direct[blk], data);
+            memcpy(data + blk_off, buf + buf_off, chunk);
+        }
+
+        int new_blk = log_append_ex(&g_state, data, (uint32_t)ino, blk);
+        if (new_blk < 0) return -ENOSPC;
+
+        inode.direct[blk] = (uint32_t)new_blk;
     }
-
-    uint8_t data[BLOCK_SIZE];
-    memset(data, 0, BLOCK_SIZE);
-    if (inode.direct[0] != 0)
-        disk_read(inode.direct[0], data);
-
-    memcpy(data + offset, buf, size);
 
     uint32_t new_end = (uint32_t)(offset + size);
-    if (new_end > inode.size)
-        inode.size = new_end;
+    if (new_end > inode.size) inode.size = new_end;
 
-    if (gc_should_run(&g_state)) {
-        printf("lfs_write: GC triggered! free=%u\n",
-               g_state.sb.total_blocks - g_state.log_tail);
-        gc_collect(&g_state);
-    }
-
-    int new_data_block = log_append_ex(&g_state, data,
-                                       (uint32_t)ino, 0);
-    if (new_data_block < 0) return -ENOSPC;
-
-    inode.direct[0] = (uint32_t)new_data_block;
     if (inode_write(&g_state, &inode) != 0) return -EIO;
-
     if (log_checkpoint(&g_state) != 0) return -EIO;
 
     printf("lfs_write: done, new log_tail=%u\n", g_state.log_tail);
@@ -338,6 +370,9 @@ static int lfs_truncate(const char *path, off_t size,
         return -EIO;
 
     inode.size = 0;
+    for (int i = 0; i < MAX_DIRECT_PTRS; i++)
+        inode.direct[i] = 0;
+
     if (inode_write(&g_state, &inode) != 0) return -EIO;
     return log_checkpoint(&g_state);
 }

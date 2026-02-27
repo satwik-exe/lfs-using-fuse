@@ -20,7 +20,7 @@
 #define SEGMENT_COUNT       (TOTAL_BLOCKS / BLOCKS_PER_SEGMENT)
 
 /* GC triggers when free blocks drop below this threshold            */
-#define GC_THRESHOLD        100
+#define GC_THRESHOLD        700
 
 #define INODE_TYPE_FILE  1
 #define INODE_TYPE_DIR   2
