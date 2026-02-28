@@ -67,7 +67,10 @@ static void *lfs_init(struct fuse_conn_info *conn,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    (void)conn; (void)cfg;
+    (void)conn;
+    cfg->kernel_cache = 0;   /* disable kernel page cache */
+    cfg->auto_cache   = 0;   /* disable auto cache invalidation */
+    cfg->direct_io    = 1;   /* bypass page cache entirely */
 
     memset(&g_state, 0, sizeof(g_state));
 
@@ -206,13 +209,22 @@ static int lfs_read(const char *path, char *buf, size_t size,
         memcpy(buf + bytes_read, data + block_off, chunk);
         bytes_read += chunk;
     }
+
     return (int)bytes_read;
+}
+
+static int lfs_open(const char *path, struct fuse_file_info *fi)
+{
+    (void)path;
+    if (fi) fi->direct_io = 1;
+    return 0;
 }
 
 static int lfs_create(const char *path, mode_t mode,
                       struct fuse_file_info *fi)
 {
-    (void)mode; (void)fi;
+    (void)mode;
+    if (fi) fi->direct_io = 1;
 
     printf("lfs_create: path=%s log_tail=%u free=%u\n",
            path, g_state.log_tail,
@@ -323,20 +335,6 @@ static int lfs_write(const char *path, const char *buf, size_t size,
 
         memcpy(data + blk_off, buf + buf_off, chunk);
 
-        if (gc_should_run(&g_state)) {
-            printf("lfs_write: GC triggered! free=%u\n",
-                   g_state.sb.total_blocks - g_state.log_tail);
-            gc_collect(&g_state);
-            /* Re-read inode — GC may have moved our blocks */
-            if (inode_read(&g_state, (uint32_t)ino, &inode) != 0)
-                return -EIO;
-            /* Re-read block again with updated pointer */
-            memset(data, 0, BLOCK_SIZE);
-            if (inode.direct[blk] != 0)
-                disk_read(inode.direct[blk], data);
-            memcpy(data + blk_off, buf + buf_off, chunk);
-        }
-
         int new_blk = log_append_ex(&g_state, data, (uint32_t)ino, blk);
         if (new_blk < 0) return -ENOSPC;
 
@@ -348,6 +346,13 @@ static int lfs_write(const char *path, const char *buf, size_t size,
 
     if (inode_write(&g_state, &inode) != 0) return -EIO;
     if (log_checkpoint(&g_state) != 0) return -EIO;
+
+    /* Run GC after the inode is fully committed — never mid-write */
+    if (gc_should_run(&g_state)) {
+        printf("lfs_write: GC triggered! free=%u\n",
+               g_state.sb.total_blocks - g_state.log_tail);
+        gc_collect(&g_state);
+    }
 
     printf("lfs_write: done, new log_tail=%u\n", g_state.log_tail);
     return (int)size;
@@ -386,6 +391,7 @@ static struct fuse_operations lfs_ops = {
     .destroy  = lfs_destroy,
     .getattr  = lfs_getattr,
     .readdir  = lfs_readdir,
+    .open     = lfs_open,
     .read     = lfs_read,
     .create   = lfs_create,
     .write    = lfs_write,

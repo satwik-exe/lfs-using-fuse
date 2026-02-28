@@ -12,15 +12,15 @@
 #define BLOCK_SIZE       4096
 #define TOTAL_BLOCKS     1024          /* 4 MB disk image            */
 #define INODE_MAP_BLOCK  1             /* block where inode map lives */
-#define INODE_MAP_SIZE   256           /* max inodes supported        */
-#define LOG_START_BLOCK  10            /* first block usable for log  */
+#define INODE_MAP_SIZE   128           /* max inodes supported        */
+#define LOG_START_BLOCK  6             /* first block usable for log  */
 
 /* Segment = 32 blocks = 128 KB                                      */
 #define BLOCKS_PER_SEGMENT  32
 #define SEGMENT_COUNT       (TOTAL_BLOCKS / BLOCKS_PER_SEGMENT)
 
 /* GC triggers when free blocks drop below this threshold            */
-#define GC_THRESHOLD        700
+#define GC_THRESHOLD        100
 
 #define INODE_TYPE_FILE  1
 #define INODE_TYPE_DIR   2
