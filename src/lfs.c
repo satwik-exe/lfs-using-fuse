@@ -1,10 +1,11 @@
 /*
  * lfs.c — FUSE frontend for the Log-Structured Filesystem
  *
- * All paths go through the inode map — nothing is hardcoded.
  * Supported operations:
  *   getattr, readdir, read          (read path)
  *   create, write, truncate         (write path)
+ *   unlink                          (Stage 6 — file deletion)
+ *   mkdir, rmdir                    (Stage 7 — subdirectories)
  */
 
 #define FUSE_USE_VERSION 31
@@ -28,25 +29,26 @@ static struct lfs_state g_state;
 /*  Internal helpers                                                    */
 /* ------------------------------------------------------------------ */
 
-static int path_to_inode(const char *path)
+/*
+ * lookup_in_dir
+ *
+ * Search directory inode 'dir_ino' for an entry named 'name'.
+ * Returns the child inode number on success, -ENOENT if not found,
+ * or a negative errno on I/O error.
+ */
+static int lookup_in_dir(uint32_t dir_ino, const char *name)
 {
-    if (strcmp(path, "/") == 0)
-        return 0;
-
-    const char *name = path + 1;
-
-    if (strchr(name, '/') != NULL)
-        return -ENOENT;
-
-    struct lfs_inode root;
-    if (inode_read(&g_state, 0, &root) != 0)
+    struct lfs_inode dir;
+    if (inode_read(&g_state, dir_ino, &dir) != 0)
         return -EIO;
+    if (dir.type != INODE_TYPE_DIR)
+        return -ENOTDIR;
 
     uint8_t buf[BLOCK_SIZE];
-    if (disk_read(root.direct[0], buf) != 0)
+    if (disk_read(dir.direct[0], buf) != 0)
         return -EIO;
 
-    int n = root.size / sizeof(struct lfs_dirent);
+    int n = dir.size / sizeof(struct lfs_dirent);
     struct lfs_dirent *entries = (struct lfs_dirent *)buf;
 
     for (int i = 0; i < n; i++) {
@@ -55,6 +57,172 @@ static int path_to_inode(const char *path)
             return (int)entries[i].inode_no;
     }
     return -ENOENT;
+}
+
+/*
+ * path_to_inode
+ *
+ * Walk a full path like "/a/b/c.txt" component by component,
+ * starting from root (inode 0).  Returns the final inode number
+ * or a negative errno.
+ */
+static int path_to_inode(const char *path)
+{
+    if (strcmp(path, "/") == 0)
+        return 0;
+
+    char tmp[4096];
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    uint32_t cur_ino = 0;
+    char *saveptr = NULL;
+    char *tok = strtok_r(tmp + 1, "/", &saveptr);
+
+    while (tok != NULL) {
+        int child = lookup_in_dir(cur_ino, tok);
+        if (child < 0) return child;
+        cur_ino = (uint32_t)child;
+        tok = strtok_r(NULL, "/", &saveptr);
+    }
+
+    return (int)cur_ino;
+}
+
+/*
+ * path_split
+ *
+ * Split a path into parent directory path and final component name.
+ * e.g. "/a/b/c.txt"  ->  parent_path="/a/b"  name="c.txt"
+ *      "/hello.txt"  ->  parent_path="/"      name="hello.txt"
+ */
+static int path_split(const char *path, char *parent_path, char *name)
+{
+    if (!path || path[0] != '/') return -EINVAL;
+
+    const char *last_slash = strrchr(path, '/');
+    if (!last_slash) return -EINVAL;
+
+    strncpy(name, last_slash + 1, MAX_NAME_LEN - 1);
+    name[MAX_NAME_LEN - 1] = '\0';
+    if (strlen(name) == 0) return -EINVAL;
+
+    size_t parent_len = (size_t)(last_slash - path);
+    if (parent_len == 0) {
+        strcpy(parent_path, "/");
+    } else {
+        strncpy(parent_path, path, parent_len);
+        parent_path[parent_len] = '\0';
+    }
+
+    return 0;
+}
+
+/*
+ * dir_add_entry
+ *
+ * Add a dirent (child_ino, child_name) to directory inode dir_ino.
+ * Reuses zeroed (deleted) slots before growing the directory.
+ */
+static int dir_add_entry(uint32_t dir_ino, uint32_t child_ino,
+                         const char *child_name)
+{
+    struct lfs_inode dir;
+    if (inode_read(&g_state, dir_ino, &dir) != 0)
+        return -EIO;
+
+    uint8_t dbuf[BLOCK_SIZE];
+    if (disk_read(dir.direct[0], dbuf) != 0)
+        return -EIO;
+
+    int slot = dir.size / sizeof(struct lfs_dirent);
+    if (slot * (int)sizeof(struct lfs_dirent) >= BLOCK_SIZE)
+        return -ENOSPC;
+
+    struct lfs_dirent *entries = (struct lfs_dirent *)dbuf;
+
+    /* Reuse a deleted slot if available */
+    int use_slot = slot;
+    for (int i = 0; i < slot; i++) {
+        if (entries[i].inode_no == 0) { use_slot = i; break; }
+    }
+
+    entries[use_slot].inode_no = child_ino;
+    strncpy(entries[use_slot].name, child_name, MAX_NAME_LEN - 1);
+    entries[use_slot].name[MAX_NAME_LEN - 1] = '\0';
+
+    int new_dir_block = log_append_ex(&g_state, dbuf, dir_ino, 0);
+    if (new_dir_block < 0) return -ENOSPC;
+
+    dir.direct[0] = (uint32_t)new_dir_block;
+    if (use_slot == slot)
+        dir.size += sizeof(struct lfs_dirent);
+
+    if (inode_write(&g_state, &dir) != 0) return -EIO;
+    return 0;
+}
+
+/*
+ * dir_remove_entry
+ *
+ * Zero out the dirent for child_ino/child_name in directory dir_ino.
+ */
+static int dir_remove_entry(uint32_t dir_ino, uint32_t child_ino,
+                            const char *child_name)
+{
+    struct lfs_inode dir;
+    if (inode_read(&g_state, dir_ino, &dir) != 0)
+        return -EIO;
+
+    uint8_t dbuf[BLOCK_SIZE];
+    if (disk_read(dir.direct[0], dbuf) != 0)
+        return -EIO;
+
+    int n = dir.size / sizeof(struct lfs_dirent);
+    struct lfs_dirent *entries = (struct lfs_dirent *)dbuf;
+    int found = 0;
+
+    for (int i = 0; i < n; i++) {
+        if (entries[i].inode_no == child_ino &&
+            strcmp(entries[i].name, child_name) == 0) {
+            memset(&entries[i], 0, sizeof(struct lfs_dirent));
+            found = 1;
+            break;
+        }
+    }
+    if (!found) return -ENOENT;
+
+    int new_dir_block = log_append_ex(&g_state, dbuf, dir_ino, 0);
+    if (new_dir_block < 0) return -ENOSPC;
+
+    dir.direct[0] = (uint32_t)new_dir_block;
+    if (inode_write(&g_state, &dir) != 0) return -EIO;
+    return 0;
+}
+
+/*
+ * dir_is_empty
+ *
+ * Returns 1 if directory dir_ino has no live entries, 0 otherwise.
+ */
+static int dir_is_empty(uint32_t dir_ino)
+{
+    struct lfs_inode dir;
+    if (inode_read(&g_state, dir_ino, &dir) != 0)
+        return 0;
+
+    uint8_t dbuf[BLOCK_SIZE];
+    if (disk_read(dir.direct[0], dbuf) != 0)
+        return 0;
+
+    int n = dir.size / sizeof(struct lfs_dirent);
+    struct lfs_dirent *entries = (struct lfs_dirent *)dbuf;
+
+    for (int i = 0; i < n; i++) {
+        if (entries[i].inode_no != 0)
+            return 0;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -68,9 +236,9 @@ static void *lfs_init(struct fuse_conn_info *conn,
     setvbuf(stderr, NULL, _IONBF, 0);
 
     (void)conn;
-    cfg->kernel_cache = 0;   /* disable kernel page cache */
-    cfg->auto_cache   = 0;   /* disable auto cache invalidation */
-    cfg->direct_io    = 1;   /* bypass page cache entirely */
+    cfg->kernel_cache = 0;
+    cfg->auto_cache   = 0;
+    cfg->direct_io    = 1;
 
     memset(&g_state, 0, sizeof(g_state));
 
@@ -230,18 +398,18 @@ static int lfs_create(const char *path, mode_t mode,
            path, g_state.log_tail,
            g_state.sb.total_blocks - g_state.log_tail);
 
-    if (path[0] != '/' || strchr(path + 1, '/') != NULL)
-        return -EPERM;
-
-    const char *name = path + 1;
+    char parent_path[4096];
+    char name[MAX_NAME_LEN];
+    if (path_split(path, parent_path, name) != 0)
+        return -EINVAL;
     if (strlen(name) >= MAX_NAME_LEN)
         return -ENAMETOOLONG;
 
+    int parent_ino = path_to_inode(parent_path);
+    if (parent_ino < 0) return parent_ino;
+
     if (path_to_inode(path) != -ENOENT)
         return -EEXIST;
-
-    int ino = inode_alloc(&g_state);
-    if (ino < 0) return -ENOSPC;
 
     if (gc_should_run(&g_state)) {
         printf("lfs_create: GC triggered! free=%u\n",
@@ -249,39 +417,22 @@ static int lfs_create(const char *path, mode_t mode,
         gc_collect(&g_state);
     }
 
-    /* Don't pre-allocate a data block — lfs_write creates blocks on demand.
-     * Leaving direct[] = 0 means the first write will allocate block 0. */
+    int ino = inode_alloc(&g_state);
+    if (ino < 0) return -ENOSPC;
+
     struct lfs_inode new_inode;
     memset(&new_inode, 0, sizeof(new_inode));
-    new_inode.inode_no  = (uint32_t)ino;
-    new_inode.type      = INODE_TYPE_FILE;
-    new_inode.size      = 0;
-    new_inode.nlinks    = 1;
-
+    new_inode.inode_no = (uint32_t)ino;
+    new_inode.type     = INODE_TYPE_FILE;
+    new_inode.size     = 0;
+    new_inode.nlinks   = 1;
     if (inode_write(&g_state, &new_inode) != 0) return -EIO;
 
-    struct lfs_inode root;
-    if (inode_read(&g_state, 0, &root) != 0) return -EIO;
+    int r = dir_add_entry((uint32_t)parent_ino, (uint32_t)ino, name);
+    if (r != 0) return r;
 
-    uint8_t dbuf[BLOCK_SIZE];
-    if (disk_read(root.direct[0], dbuf) != 0) return -EIO;
-
-    int slot = root.size / sizeof(struct lfs_dirent);
-    if (slot * (int)sizeof(struct lfs_dirent) >= BLOCK_SIZE)
-        return -ENOSPC;
-
-    struct lfs_dirent *entries = (struct lfs_dirent *)dbuf;
-    entries[slot].inode_no = (uint32_t)ino;
-    strncpy(entries[slot].name, name, MAX_NAME_LEN - 1);
-
-    int new_dir_block = log_append_ex(&g_state, dbuf, 0, 0);
-    if (new_dir_block < 0) return -ENOSPC;
-
-    root.direct[0] = (uint32_t)new_dir_block;
-    root.size      += sizeof(struct lfs_dirent);
-    if (inode_write(&g_state, &root) != 0) return -EIO;
-
-    printf("lfs_create: done, new log_tail=%u\n", g_state.log_tail);
+    printf("lfs_create: done ino=%d parent=%d log_tail=%u\n",
+           ino, parent_ino, g_state.log_tail);
     return log_checkpoint(&g_state);
 }
 
@@ -297,7 +448,6 @@ static int lfs_write(const char *path, const char *buf, size_t size,
     int ino = path_to_inode(path);
     if (ino < 0) return ino;
 
-    /* Always re-read inode fresh from disk at the start of each call */
     struct lfs_inode inode;
     if (inode_read(&g_state, (uint32_t)ino, &inode) != 0)
         return -EIO;
@@ -309,7 +459,6 @@ static int lfs_write(const char *path, const char *buf, size_t size,
     if (offset + (off_t)size > max_size)
         size = (size_t)(max_size - offset);
 
-    /* Determine which blocks are touched by this write */
     uint32_t first_blk = (uint32_t)(offset / BLOCK_SIZE);
     uint32_t last_blk  = (uint32_t)((offset + size - 1) / BLOCK_SIZE);
 
@@ -317,17 +466,15 @@ static int lfs_write(const char *path, const char *buf, size_t size,
         uint32_t blk_start = blk * BLOCK_SIZE;
         uint32_t blk_end   = blk_start + BLOCK_SIZE;
 
-        /* Byte range within buf that falls in this block */
         uint32_t write_start = (uint32_t)offset > blk_start
                                ? (uint32_t)offset : blk_start;
         uint32_t write_end   = (uint32_t)(offset + size) < blk_end
                                ? (uint32_t)(offset + size) : blk_end;
 
-        uint32_t blk_off  = write_start - blk_start;
-        uint32_t buf_off  = write_start - (uint32_t)offset;
-        uint32_t chunk    = write_end - write_start;
+        uint32_t blk_off = write_start - blk_start;
+        uint32_t buf_off = write_start - (uint32_t)offset;
+        uint32_t chunk   = write_end - write_start;
 
-        /* Read existing block content (preserve bytes not being written) */
         uint8_t data[BLOCK_SIZE];
         memset(data, 0, BLOCK_SIZE);
         if (inode.direct[blk] != 0)
@@ -337,7 +484,6 @@ static int lfs_write(const char *path, const char *buf, size_t size,
 
         int new_blk = log_append_ex(&g_state, data, (uint32_t)ino, blk);
         if (new_blk < 0) return -ENOSPC;
-
         inode.direct[blk] = (uint32_t)new_blk;
     }
 
@@ -347,7 +493,6 @@ static int lfs_write(const char *path, const char *buf, size_t size,
     if (inode_write(&g_state, &inode) != 0) return -EIO;
     if (log_checkpoint(&g_state) != 0) return -EIO;
 
-    /* Run GC after the inode is fully committed — never mid-write */
     if (gc_should_run(&g_state)) {
         printf("lfs_write: GC triggered! free=%u\n",
                g_state.sb.total_blocks - g_state.log_tail);
@@ -362,9 +507,7 @@ static int lfs_truncate(const char *path, off_t size,
                         struct fuse_file_info *fi)
 {
     (void)fi;
-
     printf("lfs_truncate: path=%s size=%ld\n", path, size);
-
     if (size != 0) return -EPERM;
 
     int ino = path_to_inode(path);
@@ -383,6 +526,153 @@ static int lfs_truncate(const char *path, off_t size,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Stage 6: unlink — delete a file                                     */
+/* ------------------------------------------------------------------ */
+
+static int lfs_unlink(const char *path)
+{
+    printf("lfs_unlink: path=%s\n", path);
+
+    char parent_path[4096];
+    char name[MAX_NAME_LEN];
+    if (path_split(path, parent_path, name) != 0)
+        return -EINVAL;
+
+    int ino = path_to_inode(path);
+    if (ino < 0) return ino;
+    if (ino == 0) return -EPERM;
+
+    struct lfs_inode inode;
+    if (inode_read(&g_state, (uint32_t)ino, &inode) != 0)
+        return -EIO;
+    if (inode.type == INODE_TYPE_DIR)
+        return -EISDIR;
+
+    int parent_ino = path_to_inode(parent_path);
+    if (parent_ino < 0) return parent_ino;
+
+    int r = dir_remove_entry((uint32_t)parent_ino, (uint32_t)ino, name);
+    if (r != 0) return r;
+
+    /* Free inode — all data blocks become dead for GC */
+    g_state.inode_map[ino] = 0;
+
+    if (log_checkpoint(&g_state) != 0) return -EIO;
+
+    printf("lfs_unlink: freed inode %d, log_tail=%u free=%u\n",
+           ino, g_state.log_tail,
+           g_state.sb.total_blocks - g_state.log_tail);
+
+    if (gc_should_run(&g_state))
+        gc_collect(&g_state);
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Stage 7: mkdir / rmdir — subdirectories                            */
+/* ------------------------------------------------------------------ */
+
+static int lfs_mkdir(const char *path, mode_t mode)
+{
+    (void)mode;
+    printf("lfs_mkdir: path=%s\n", path);
+
+    char parent_path[4096];
+    char name[MAX_NAME_LEN];
+    if (path_split(path, parent_path, name) != 0)
+        return -EINVAL;
+    if (strlen(name) >= MAX_NAME_LEN)
+        return -ENAMETOOLONG;
+
+    int parent_ino = path_to_inode(parent_path);
+    if (parent_ino < 0) return parent_ino;
+
+    if (path_to_inode(path) != -ENOENT)
+        return -EEXIST;
+
+    if (gc_should_run(&g_state)) {
+        printf("lfs_mkdir: GC triggered!\n");
+        gc_collect(&g_state);
+    }
+
+    int ino = inode_alloc(&g_state);
+    if (ino < 0) return -ENOSPC;
+
+    /*
+     * Write an empty data block to the log first so direct[0] is
+     * valid before anyone tries to read this directory's entries.
+     */
+    uint8_t empty[BLOCK_SIZE];
+    memset(empty, 0, BLOCK_SIZE);
+    int data_blk = log_append_ex(&g_state, empty, (uint32_t)ino, 0);
+    if (data_blk < 0) return -ENOSPC;
+
+    struct lfs_inode new_dir;
+    memset(&new_dir, 0, sizeof(new_dir));
+    new_dir.inode_no  = (uint32_t)ino;
+    new_dir.type      = INODE_TYPE_DIR;
+    new_dir.size      = 0;
+    new_dir.nlinks    = 2;
+    new_dir.direct[0] = (uint32_t)data_blk;
+    if (inode_write(&g_state, &new_dir) != 0) return -EIO;
+
+    int r = dir_add_entry((uint32_t)parent_ino, (uint32_t)ino, name);
+    if (r != 0) return r;
+
+    if (log_checkpoint(&g_state) != 0) return -EIO;
+
+    printf("lfs_mkdir: created dir ino=%d parent=%d log_tail=%u\n",
+           ino, parent_ino, g_state.log_tail);
+    return 0;
+}
+
+static int lfs_rmdir(const char *path)
+{
+    printf("lfs_rmdir: path=%s\n", path);
+
+    if (strcmp(path, "/") == 0) return -EPERM;
+
+    char parent_path[4096];
+    char name[MAX_NAME_LEN];
+    if (path_split(path, parent_path, name) != 0)
+        return -EINVAL;
+
+    int ino = path_to_inode(path);
+    if (ino < 0) return ino;
+    if (ino == 0) return -EPERM;
+
+    struct lfs_inode inode;
+    if (inode_read(&g_state, (uint32_t)ino, &inode) != 0)
+        return -EIO;
+    if (inode.type != INODE_TYPE_DIR)
+        return -ENOTDIR;
+
+    if (!dir_is_empty((uint32_t)ino))
+        return -ENOTEMPTY;
+
+    int parent_ino = path_to_inode(parent_path);
+    if (parent_ino < 0) return parent_ino;
+
+    int r = dir_remove_entry((uint32_t)parent_ino, (uint32_t)ino, name);
+    if (r != 0) return r;
+
+    /* Free inode — directory data block becomes dead for GC */
+    g_state.inode_map[ino] = 0;
+
+    if (log_checkpoint(&g_state) != 0) return -EIO;
+
+    printf("lfs_rmdir: freed dir ino=%d log_tail=%u free=%u\n",
+           ino, g_state.log_tail,
+           g_state.sb.total_blocks - g_state.log_tail);
+
+    if (gc_should_run(&g_state))
+        gc_collect(&g_state);
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  FUSE ops table + main                                               */
 /* ------------------------------------------------------------------ */
 
@@ -396,6 +686,9 @@ static struct fuse_operations lfs_ops = {
     .create   = lfs_create,
     .write    = lfs_write,
     .truncate = lfs_truncate,
+    .unlink   = lfs_unlink,   /* Stage 6 */
+    .mkdir    = lfs_mkdir,    /* Stage 7 */
+    .rmdir    = lfs_rmdir,    /* Stage 7 */
 };
 
 int main(int argc, char *argv[])
