@@ -6,6 +6,7 @@
  *   create, write, truncate         (write path)
  *   unlink                          (Stage 6 — file deletion)
  *   mkdir, rmdir                    (Stage 7 — subdirectories)
+ *   crash recovery on mount         (Stage 8)
  */
 
 #define FUSE_USE_VERSION 31
@@ -29,13 +30,6 @@ static struct lfs_state g_state;
 /*  Internal helpers                                                    */
 /* ------------------------------------------------------------------ */
 
-/*
- * lookup_in_dir
- *
- * Search directory inode 'dir_ino' for an entry named 'name'.
- * Returns the child inode number on success, -ENOENT if not found,
- * or a negative errno on I/O error.
- */
 static int lookup_in_dir(uint32_t dir_ino, const char *name)
 {
     struct lfs_inode dir;
@@ -59,13 +53,6 @@ static int lookup_in_dir(uint32_t dir_ino, const char *name)
     return -ENOENT;
 }
 
-/*
- * path_to_inode
- *
- * Walk a full path like "/a/b/c.txt" component by component,
- * starting from root (inode 0).  Returns the final inode number
- * or a negative errno.
- */
 static int path_to_inode(const char *path)
 {
     if (strcmp(path, "/") == 0)
@@ -89,13 +76,6 @@ static int path_to_inode(const char *path)
     return (int)cur_ino;
 }
 
-/*
- * path_split
- *
- * Split a path into parent directory path and final component name.
- * e.g. "/a/b/c.txt"  ->  parent_path="/a/b"  name="c.txt"
- *      "/hello.txt"  ->  parent_path="/"      name="hello.txt"
- */
 static int path_split(const char *path, char *parent_path, char *name)
 {
     if (!path || path[0] != '/') return -EINVAL;
@@ -118,12 +98,6 @@ static int path_split(const char *path, char *parent_path, char *name)
     return 0;
 }
 
-/*
- * dir_add_entry
- *
- * Add a dirent (child_ino, child_name) to directory inode dir_ino.
- * Reuses zeroed (deleted) slots before growing the directory.
- */
 static int dir_add_entry(uint32_t dir_ino, uint32_t child_ino,
                          const char *child_name)
 {
@@ -141,7 +115,6 @@ static int dir_add_entry(uint32_t dir_ino, uint32_t child_ino,
 
     struct lfs_dirent *entries = (struct lfs_dirent *)dbuf;
 
-    /* Reuse a deleted slot if available */
     int use_slot = slot;
     for (int i = 0; i < slot; i++) {
         if (entries[i].inode_no == 0) { use_slot = i; break; }
@@ -162,11 +135,6 @@ static int dir_add_entry(uint32_t dir_ino, uint32_t child_ino,
     return 0;
 }
 
-/*
- * dir_remove_entry
- *
- * Zero out the dirent for child_ino/child_name in directory dir_ino.
- */
 static int dir_remove_entry(uint32_t dir_ino, uint32_t child_ino,
                             const char *child_name)
 {
@@ -200,11 +168,6 @@ static int dir_remove_entry(uint32_t dir_ino, uint32_t child_ino,
     return 0;
 }
 
-/*
- * dir_is_empty
- *
- * Returns 1 if directory dir_ino has no live entries, 0 otherwise.
- */
 static int dir_is_empty(uint32_t dir_ino)
 {
     struct lfs_inode dir;
@@ -267,6 +230,16 @@ static void *lfs_init(struct fuse_conn_info *conn,
     memcpy(g_state.inode_map, buf, INODE_MAP_SIZE * sizeof(uint32_t));
 
     g_state.log_tail = g_state.sb.log_tail;
+
+    /*
+     * Stage 8: run crash recovery before allowing any operations.
+     * log_recover checks the commit block and repairs state if needed.
+     */
+    if (log_recover(&g_state) != 0) {
+        fprintf(stderr, "lfs_init: recovery failed — unmounting\n");
+        disk_close();
+        return NULL;
+    }
 
     printf("LFS mounted: %u blocks, log tail at block %u\n",
            g_state.sb.total_blocks, g_state.log_tail);
@@ -526,7 +499,7 @@ static int lfs_truncate(const char *path, off_t size,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Stage 6: unlink — delete a file                                     */
+/*  Stage 6: unlink                                                     */
 /* ------------------------------------------------------------------ */
 
 static int lfs_unlink(const char *path)
@@ -554,7 +527,6 @@ static int lfs_unlink(const char *path)
     int r = dir_remove_entry((uint32_t)parent_ino, (uint32_t)ino, name);
     if (r != 0) return r;
 
-    /* Free inode — all data blocks become dead for GC */
     g_state.inode_map[ino] = 0;
 
     if (log_checkpoint(&g_state) != 0) return -EIO;
@@ -570,7 +542,7 @@ static int lfs_unlink(const char *path)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Stage 7: mkdir / rmdir — subdirectories                            */
+/*  Stage 7: mkdir / rmdir                                              */
 /* ------------------------------------------------------------------ */
 
 static int lfs_mkdir(const char *path, mode_t mode)
@@ -599,10 +571,6 @@ static int lfs_mkdir(const char *path, mode_t mode)
     int ino = inode_alloc(&g_state);
     if (ino < 0) return -ENOSPC;
 
-    /*
-     * Write an empty data block to the log first so direct[0] is
-     * valid before anyone tries to read this directory's entries.
-     */
     uint8_t empty[BLOCK_SIZE];
     memset(empty, 0, BLOCK_SIZE);
     int data_blk = log_append_ex(&g_state, empty, (uint32_t)ino, 0);
@@ -657,7 +625,6 @@ static int lfs_rmdir(const char *path)
     int r = dir_remove_entry((uint32_t)parent_ino, (uint32_t)ino, name);
     if (r != 0) return r;
 
-    /* Free inode — directory data block becomes dead for GC */
     g_state.inode_map[ino] = 0;
 
     if (log_checkpoint(&g_state) != 0) return -EIO;

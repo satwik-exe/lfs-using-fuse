@@ -40,7 +40,8 @@ struct lfs_superblock {
     uint32_t inode_map_block;  /* which block holds the inode map   */
     uint32_t log_start;        /* first writable log block          */
     uint32_t log_tail;         /* next free block in the log        */
-    uint8_t  _pad[BLOCK_SIZE - 6*sizeof(uint32_t)];
+    uint32_t commit_seq;       /* sequence number of last commit    */
+    uint8_t  _pad[BLOCK_SIZE - 7*sizeof(uint32_t)];
 } __attribute__((packed));
 
 /* One inode — stored inside a log block */
@@ -61,19 +62,43 @@ struct lfs_dirent {
 
 /*
  * Segment summary — stored as the FIRST block of every segment.
- * For each block in the segment, records which inode owns it and
- * which logical block within that file it represents.
- * This is what GC uses to decide if a block is live or dead.
  */
 struct lfs_segment_summary {
-    /* entry[i] describes the (i+1)th block of the segment
-       (entry[0] is skipped — that block IS the summary)            */
     struct {
-        uint32_t inode_no;   /* which inode owns this block         */
-        uint32_t block_idx;  /* index into inode->direct[]          */
+        uint32_t inode_no;
+        uint32_t block_idx;
     } entry[BLOCKS_PER_SEGMENT];
     uint8_t _pad[BLOCK_SIZE
                  - BLOCKS_PER_SEGMENT * 2 * sizeof(uint32_t)];
+} __attribute__((packed));
+
+/*
+ * Commit block — Stage 8 crash recovery.
+ *
+ * Written as the LAST action of every log_checkpoint.
+ * Stored at a fixed location: block 2 (just after inode map).
+ *
+ * Recovery logic on mount:
+ *   Read the commit block.  If commit_magic matches and
+ *   commit_seq == superblock.commit_seq, the last checkpoint
+ *   completed fully — trust the superblock's log_tail.
+ *
+ *   Otherwise the last checkpoint was interrupted mid-write.
+ *   Scan forward from log_start to find the true end of the log
+ *   and rewind log_tail to the last fully-written block.
+ *
+ * The checksum is a simple XOR of all inode_map[] entries so we
+ * can detect a partially-written inode map block.
+ */
+#define LFS_COMMIT_MAGIC  0xC0FFEE42
+#define COMMIT_BLOCK      2            /* fixed location on disk     */
+
+struct lfs_commit {
+    uint32_t commit_magic;   /* LFS_COMMIT_MAGIC                    */
+    uint32_t commit_seq;     /* must match superblock.commit_seq    */
+    uint32_t log_tail;       /* log_tail at time of this checkpoint */
+    uint32_t imap_crc;       /* XOR checksum of inode_map[]         */
+    uint8_t  _pad[BLOCK_SIZE - 4*sizeof(uint32_t)];
 } __attribute__((packed));
 
 /* ================================================================
@@ -99,6 +124,7 @@ void disk_close(void);
    ================================================================ */
 int  log_append    (struct lfs_state *state, const void *buf);
 int  log_checkpoint(struct lfs_state *state);
+int  log_recover   (struct lfs_state *state);   /* Stage 8 */
 
 /* ================================================================
    Inode helpers  (inode.c)
@@ -111,11 +137,7 @@ int  inode_alloc(struct lfs_state *state);
 /* ================================================================
    Garbage collector  (gc.c)
    ================================================================ */
-
-/* Returns 1 if GC should run (disk getting full), 0 otherwise       */
 int  gc_should_run(struct lfs_state *state);
-
-/* Run one GC pass — clean the segment with most dead blocks         */
 int  gc_collect   (struct lfs_state *state);
 
 #endif /* LFS_H */
