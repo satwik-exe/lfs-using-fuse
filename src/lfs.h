@@ -13,7 +13,7 @@
 #define TOTAL_BLOCKS     1024          /* 4 MB disk image            */
 #define INODE_MAP_BLOCK  1             /* block where inode map lives */
 #define INODE_MAP_SIZE   128           /* max inodes supported        */
-#define LOG_START_BLOCK  6             /* first block usable for log  */
+#define LOG_START_BLOCK  7             /* first block usable for log  */
 
 /* Segment = 32 blocks = 128 KB                                      */
 #define BLOCKS_PER_SEGMENT  32
