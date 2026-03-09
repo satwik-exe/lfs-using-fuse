@@ -1,21 +1,20 @@
-# Compiled binaries
+# Build artifacts
 lfs
 mkfs_lfs
+src/*.o
 
 # Disk image
 lfs.img
 
-# Compiled files
-src/*.o
-src/lfs.o
-src/disk.o
-src/log.o
-src/inode.o
-src/mkfs_lfs.o
+# Mount point contents (never commit what's inside the mounted fs)
+mount/*
+!mount/.gitkeep
 
-# Mount directory
-mount/
-
-# Editor temp files
+# Editor / OS junk
+.DS_Store
 *.swp
-*.out
+*.swo
+*~
+
+# Duplicate README in src/ (README belongs only in root)
+src/README.md
