@@ -334,6 +334,10 @@ static int lfs_read(const char *path, char *buf, size_t size,
     if (offset + (off_t)size > (off_t)inode.size)
         size = inode.size - offset;
 
+    /* Cache the indirect block if we'll need it */
+    uint32_t indirect_ptrs[PTRS_PER_BLOCK];
+    int indirect_loaded = 0;
+
     size_t bytes_read = 0;
     while (bytes_read < size) {
         uint32_t block_idx = (uint32_t)((offset + bytes_read) / BLOCK_SIZE);
@@ -342,10 +346,27 @@ static int lfs_read(const char *path, char *buf, size_t size,
         size_t chunk = BLOCK_SIZE - block_off;
         if (chunk > size - bytes_read) chunk = size - bytes_read;
 
+        /* Resolve block_idx to a physical block number */
+        uint32_t phys_blk = 0;
+        if (block_idx < MAX_DIRECT_PTRS) {
+            phys_blk = inode.direct[block_idx];
+        } else {
+            /* Indirect region: index into the indirect block */
+            uint32_t ind_idx = block_idx - MAX_DIRECT_PTRS;
+            if (inode.indirect != 0) {
+                if (!indirect_loaded) {
+                    memset(indirect_ptrs, 0, sizeof(indirect_ptrs));
+                    disk_read(inode.indirect, indirect_ptrs);
+                    indirect_loaded = 1;
+                }
+                phys_blk = indirect_ptrs[ind_idx];
+            }
+        }
+
         uint8_t data[BLOCK_SIZE];
         memset(data, 0, BLOCK_SIZE);
-        if (inode.direct[block_idx] != 0)
-            disk_read(inode.direct[block_idx], data);
+        if (phys_blk != 0)
+            disk_read(phys_blk, data);
 
         memcpy(buf + bytes_read, data + block_off, chunk);
         bytes_read += chunk;
@@ -427,13 +448,29 @@ static int lfs_write(const char *path, const char *buf, size_t size,
     if (inode.type != INODE_TYPE_FILE)
         return -EISDIR;
 
-    off_t max_size = (off_t)MAX_DIRECT_PTRS * BLOCK_SIZE;
+    off_t max_size = (off_t)MAX_FILE_BLOCKS * BLOCK_SIZE;
     if (offset >= max_size) return -EFBIG;
     if (offset + (off_t)size > max_size)
         size = (size_t)(max_size - offset);
 
     uint32_t first_blk = (uint32_t)(offset / BLOCK_SIZE);
     uint32_t last_blk  = (uint32_t)((offset + size - 1) / BLOCK_SIZE);
+
+    /*
+     * Load the indirect block once if any touched block is in
+     * the indirect region.  We'll write it back at the end if dirty.
+     */
+    uint32_t indirect_ptrs[PTRS_PER_BLOCK];
+    int indirect_loaded = 0;
+    int indirect_dirty  = 0;
+
+    if (last_blk >= MAX_DIRECT_PTRS) {
+        memset(indirect_ptrs, 0, sizeof(indirect_ptrs));
+        if (inode.indirect != 0) {
+            disk_read(inode.indirect, indirect_ptrs);
+        }
+        indirect_loaded = 1;
+    }
 
     for (uint32_t blk = first_blk; blk <= last_blk; blk++) {
         uint32_t blk_start = blk * BLOCK_SIZE;
@@ -448,16 +485,38 @@ static int lfs_write(const char *path, const char *buf, size_t size,
         uint32_t buf_off = write_start - (uint32_t)offset;
         uint32_t chunk   = write_end - write_start;
 
+        /* Read existing block content */
         uint8_t data[BLOCK_SIZE];
         memset(data, 0, BLOCK_SIZE);
-        if (inode.direct[blk] != 0)
-            disk_read(inode.direct[blk], data);
+
+        uint32_t phys_blk = 0;
+        if (blk < MAX_DIRECT_PTRS) {
+            phys_blk = inode.direct[blk];
+        } else {
+            phys_blk = indirect_ptrs[blk - MAX_DIRECT_PTRS];
+        }
+        if (phys_blk != 0)
+            disk_read(phys_blk, data);
 
         memcpy(data + blk_off, buf + buf_off, chunk);
 
         int new_blk = log_append_ex(&g_state, data, (uint32_t)ino, blk);
         if (new_blk < 0) return -ENOSPC;
-        inode.direct[blk] = (uint32_t)new_blk;
+
+        if (blk < MAX_DIRECT_PTRS) {
+            inode.direct[blk] = (uint32_t)new_blk;
+        } else {
+            indirect_ptrs[blk - MAX_DIRECT_PTRS] = (uint32_t)new_blk;
+            indirect_dirty = 1;
+        }
+    }
+
+    /* Write back the indirect block if it was modified */
+    if (indirect_loaded && indirect_dirty) {
+        int new_ind = log_append_ex(&g_state, indirect_ptrs,
+                                    (uint32_t)ino, MAX_DIRECT_PTRS);
+        if (new_ind < 0) return -ENOSPC;
+        inode.indirect = (uint32_t)new_ind;
     }
 
     uint32_t new_end = (uint32_t)(offset + size);
@@ -490,9 +549,10 @@ static int lfs_truncate(const char *path, off_t size,
     if (inode_read(&g_state, (uint32_t)ino, &inode) != 0)
         return -EIO;
 
-    inode.size = 0;
+    inode.size     = 0;
     for (int i = 0; i < MAX_DIRECT_PTRS; i++)
         inode.direct[i] = 0;
+    inode.indirect = 0;   /* Stage 9: drop indirect block too */
 
     if (inode_write(&g_state, &inode) != 0) return -EIO;
     return log_checkpoint(&g_state);

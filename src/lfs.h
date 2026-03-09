@@ -28,6 +28,15 @@
 #define MAX_DIRECT_PTRS  10
 #define MAX_NAME_LEN     28
 
+/* Number of block pointers that fit in one 4KB indirect block       */
+#define PTRS_PER_BLOCK   (BLOCK_SIZE / sizeof(uint32_t))   /* 1024   */
+
+/* Max file size:
+ *   10 direct blocks        =   40 KB
+ *   1 indirect → 1024 ptrs = 4096 KB
+ *   Total                  = 4136 KB                                 */
+#define MAX_FILE_BLOCKS  (MAX_DIRECT_PTRS + PTRS_PER_BLOCK)
+
 /* ================================================================
    On-disk structures  (all must fit inside BLOCK_SIZE)
    ================================================================ */
@@ -51,7 +60,8 @@ struct lfs_inode {
     uint32_t size;             /* bytes                             */
     uint32_t nlinks;
     uint32_t direct[MAX_DIRECT_PTRS]; /* block numbers for data     */
-    uint8_t  _pad[BLOCK_SIZE - (4 + MAX_DIRECT_PTRS)*sizeof(uint32_t)];
+    uint32_t indirect;         /* block holding 1024 more ptrs      */
+    uint8_t  _pad[BLOCK_SIZE - (5 + MAX_DIRECT_PTRS)*sizeof(uint32_t)];
 } __attribute__((packed));
 
 /* One directory entry */

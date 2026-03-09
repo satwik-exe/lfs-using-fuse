@@ -40,6 +40,18 @@ int gc_collect(struct lfs_state *state)
             if (inode->direct[j] != 0 && inode->direct[j] < TOTAL_BLOCKS)
                 live[inode->direct[j]] = 1;
         }
+        /* Stage 9: mark indirect block and all blocks it points to */
+        if (inode->indirect != 0 && inode->indirect < TOTAL_BLOCKS) {
+            live[inode->indirect] = 1;
+            uint32_t ind_ptrs[BLOCK_SIZE / sizeof(uint32_t)];
+            memset(ind_ptrs, 0, sizeof(ind_ptrs));
+            if (disk_read(inode->indirect, ind_ptrs) == 0) {
+                for (int j = 0; j < (int)(BLOCK_SIZE / sizeof(uint32_t)); j++) {
+                    if (ind_ptrs[j] != 0 && ind_ptrs[j] < TOTAL_BLOCKS)
+                        live[ind_ptrs[j]] = 1;
+                }
+            }
+        }
     }
 
     /* Count dead blocks */
@@ -99,13 +111,15 @@ int gc_collect(struct lfs_state *state)
         }
     }
 
-    /* Then update direct[] pointers inside each inode */
+    /* Then update direct[] and indirect pointers inside each inode */
     for (int i = 0; i < INODE_MAP_SIZE; i++) {
         if (state->inode_map[i] == 0) continue;
         uint8_t buf[BLOCK_SIZE];
         if (disk_read(state->inode_map[i], buf) != 0) continue;
         struct lfs_inode *inode = (struct lfs_inode *)buf;
         int dirty = 0;
+
+        /* Fix direct[] pointers */
         for (int j = 0; j < MAX_DIRECT_PTRS; j++) {
             for (int r = 0; r < nrelo; r++) {
                 if (inode->direct[j] == relo_old[r]) {
@@ -115,7 +129,35 @@ int gc_collect(struct lfs_state *state)
                 }
             }
         }
+
+        /* Fix indirect block pointer */
+        for (int r = 0; r < nrelo; r++) {
+            if (inode->indirect == relo_old[r]) {
+                inode->indirect = relo_new[r];
+                dirty = 1;
+                break;
+            }
+        }
+
         if (dirty) disk_write(state->inode_map[i], buf);
+
+        /* Fix pointers inside the indirect block itself */
+        if (inode->indirect != 0) {
+            uint32_t ind_ptrs[BLOCK_SIZE / sizeof(uint32_t)];
+            memset(ind_ptrs, 0, sizeof(ind_ptrs));
+            if (disk_read(inode->indirect, ind_ptrs) != 0) continue;
+            int ind_dirty = 0;
+            for (int j = 0; j < (int)(BLOCK_SIZE / sizeof(uint32_t)); j++) {
+                for (int r = 0; r < nrelo; r++) {
+                    if (ind_ptrs[j] == relo_old[r]) {
+                        ind_ptrs[j] = relo_new[r];
+                        ind_dirty = 1;
+                        break;
+                    }
+                }
+            }
+            if (ind_dirty) disk_write(inode->indirect, ind_ptrs);
+        }
     }
 
     /*
@@ -136,6 +178,15 @@ int gc_collect(struct lfs_state *state)
         struct lfs_inode *in = (struct lfs_inode *)buf;
         for (int j = 0; j < MAX_DIRECT_PTRS; j++)
             if (in->direct[j] > highest) highest = in->direct[j];
+        if (in->indirect > highest) highest = in->indirect;
+        if (in->indirect != 0) {
+            uint32_t ind_ptrs[BLOCK_SIZE / sizeof(uint32_t)];
+            memset(ind_ptrs, 0, sizeof(ind_ptrs));
+            if (disk_read(in->indirect, ind_ptrs) == 0) {
+                for (int j = 0; j < (int)(BLOCK_SIZE / sizeof(uint32_t)); j++)
+                    if (ind_ptrs[j] > highest) highest = ind_ptrs[j];
+            }
+        }
     }
 
     uint32_t new_tail = highest + 1;
